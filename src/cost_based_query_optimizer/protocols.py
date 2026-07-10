@@ -18,6 +18,7 @@ más elaboradas, pero el contrato (`Protocol`) es el mismo.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from typing import Protocol, runtime_checkable
 
 from .models import (
@@ -60,23 +61,53 @@ class CardinalityEstimator(Protocol):
         self,
         left_rows: float,
         right_rows: float,
-        join_column_on_new_table: ColumnRef | None,
-        new_table_stats: TableStatistics,
-        has_unrecognized_predicate: bool,
+        equi_join_distinct_counts: Sequence[tuple[float, float]],
+        unrecognized_conjunct_count: int,
     ) -> float:
         """Cardinalidad estimada de unir `left_rows` filas acumuladas con
         `right_rows` filas de la tabla base que se añade en este paso.
 
-        - `join_column_on_new_table` es la columna del lado de la tabla
-          nueva en una igualdad de join reconocida (`a.x = b.y`), ya
-          reorientada por `predicates.orient_equi_condition`, o `None` si el
-          conjunto de condiciones de este paso no contiene ninguna igualdad
-          directa entre columnas.
-        - `has_unrecognized_predicate` distingue "no hay ninguna condición
-          en absoluto" (producto cartesiano real) de "hay condición pero no
-          es una igualdad reconocible" (p. ej. un join por rango): en el
-          segundo caso conviene reducir algo la cardinalidad aunque no se
-          pueda estimar con precisión, en vez de tratarlo como cartesiano.
+        - `equi_join_distinct_counts`: un par `(distinct_izquierda,
+          distinct_derecha)` por cada igualdad de join reconocida en este
+          paso (`a.x = b.y`) — el `distinct_count` **crudo, sin filtrar**
+          (tal cual está en el catálogo) de la columna a cada lado, ya
+          resueltos por `physical.py` contra la tabla base que corresponda.
+          Deliberadamente **no** se recibe aquí el `TableStatistics` de la
+          tabla nueva para que este método los busque: dos razones,
+          ambas necesarias para que la cardinalidad de un subconjunto de
+          tablas sea una función pura de ESE subconjunto, de la que depende
+          la subestructura óptima de `physical._dp_join_order`:
+
+          1. **Simetría.** Si sólo se mirase el `distinct_count` del lado
+             "nuevo" (el que se añade en este paso), unir A con B daría una
+             cardinalidad distinta según cuál de las dos sea la "nueva" —
+             pero es la MISMA operación matemática (`A ⋈ B`) da igual en
+             qué orden se explore. Se usa `max(distinct_izquierda,
+             distinct_derecha)` — la fórmula de contención simétrica
+             estándar — precisamente para que no importe.
+          2. **Estabilidad frente a filtros previos.** Si se usara el
+             `distinct_count` de una tabla que YA se filtró en un paso
+             anterior (p. ej. escalado a su cardinalidad actual), el
+             resultado dependería de qué otros filtros ya se aplicaron
+             antes de este join — y por tanto, de nuevo, del ORDEN de
+             inserción, no sólo del subconjunto final.
+
+          **Cada par de esta lista debe reducir la cardinalidad por su
+          cuenta** (nunca "sólo el primero cuenta, el resto es filtro
+          residual sin efecto en el recuento de filas") por la misma razón:
+          si sólo el primero contase, el resultado dependería de en qué
+          paso concreto se completó cada igualdad. Se detectó exactamente
+          así — con las dos limitaciones de arriba — mediante un test de
+          propiedades (`test_properties.py`) que encontró casos en los que
+          la fuerza bruta lograba un coste menor que el DP porque la
+          cardinalidad de un mismo subconjunto salía distinta según el
+          orden probado; ver el hallazgo documentado en `../PROGRESS.md`.
+        - `unrecognized_conjunct_count`: cuántas condiciones de este paso no
+          son una igualdad directa reconocible (p. ej. un join por rango) —
+          cada una reduce la cardinalidad por su cuenta con un factor por
+          defecto, por la misma razón de arriba. Cero condiciones en
+          absoluto (`equi_join_distinct_counts` vacío y este valor en `0`)
+          es un producto cartesiano real, sin reducción.
         """
         ...
 
@@ -232,20 +263,15 @@ class SimpleCardinalityEstimator:
         self,
         left_rows: float,
         right_rows: float,
-        join_column_on_new_table: ColumnRef | None,
-        new_table_stats: TableStatistics,
-        has_unrecognized_predicate: bool,
+        equi_join_distinct_counts: Sequence[tuple[float, float]],
+        unrecognized_conjunct_count: int,
     ) -> float:
-        if join_column_on_new_table is not None:
-            column_stats = new_table_stats.columns.get(join_column_on_new_table.name)
-            if column_stats is not None and column_stats.distinct_count > 0:
-                distinct = float(column_stats.distinct_count)
-            else:
-                distinct = max(right_rows, 1.0)
-            return (left_rows * right_rows) / max(distinct, 1.0)
-        if has_unrecognized_predicate:
-            return left_rows * right_rows * self.DEFAULT_JOIN_SELECTIVITY
-        return left_rows * right_rows
+        rows = left_rows * right_rows
+        for distinct_left, distinct_right in equi_join_distinct_counts:
+            rows /= max(distinct_left, distinct_right, 1.0)
+        if unrecognized_conjunct_count > 0:
+            rows *= self.DEFAULT_JOIN_SELECTIVITY**unrecognized_conjunct_count
+        return rows
 
 
 class SimpleCostModel:

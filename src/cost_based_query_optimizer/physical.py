@@ -94,7 +94,13 @@ from .plan import (
     PhysicalSort,
     PhysicalTableScan,
 )
-from .predicates import combine_conjuncts, orient_equi_condition, split_conjuncts, touched_tables
+from .predicates import (
+    combine_conjuncts,
+    orient_equi_condition,
+    resolve_table_index,
+    split_conjuncts,
+    touched_tables,
+)
 from .protocols import CardinalityEstimator, CostModel
 
 #: Por encima de este número de tablas en una cadena de INNER JOIN, la
@@ -274,28 +280,46 @@ def _build_pool(
     return conjuncts
 
 
-def _applicable_at(conjuncts: list[_Conjunct], subset: int, t: int) -> list[Expression]:
-    """Conjuntos que se aplican exactamente al añadir la tabla `t` para
-    completar `subset` (`subset` ya incluye el bit de `t`).
+def _applicable_at(conjuncts: list[_Conjunct], prev: int, t: int) -> list[Expression]:
+    """Conjuntos que se aplican exactamente al añadir la tabla `t` sobre el
+    acumulado `prev` (`prev` NO incluye todavía el bit de `t`; `prev = 0`
+    para el caso base, el scan de `t` en solitario).
 
     Demostración de que cada conjunto se aplica en exactamente un paso, para
     cualquier orden de inserción `o = (t_1, ..., t_n)`: sea `T` el conjunto
     de tablas que toca un conjunto dado y `t_k` la ÚLTIMA de ellas en
-    aparecer en `o`. En el paso que inserta `t_k`, el subconjunto acumulado
-    es `{t_1, ..., t_k}` ⊇ `T` (todas las demás tablas de `T` ya están,
-    por ser `t_k` la última) y `t_k ∈ T`, así que se aplica ahí. En
-    cualquier paso anterior `j < k` con `t_j ∈ T`, el subconjunto acumulado
-    es `{t_1, ..., t_j}`, que NO contiene a `t_k` (aún no insertada) — y
-    `t_k ∈ T` — así que `T ⊄ subconjunto` y no se aplica todavía. Por tanto
-    se aplica en ese único paso, nunca antes, nunca después ni dos veces.
+    aparecer en `o`. En el paso que inserta `t_k` (`prev = {t_1,...,t_{k-1}}`),
+    el subconjunto acumulado tras insertar es `{t_1, ..., t_k}` ⊇ `T` (todas
+    las demás tablas de `T` ya están, por ser `t_k` la última) y `t_k ∈ T`,
+    así que se aplica ahí. En cualquier paso anterior `j < k` con `t_j ∈ T`,
+    el subconjunto acumulado tras insertar es `{t_1, ..., t_j}`, que NO
+    contiene a `t_k` (aún no insertada) — así que `T ⊄ subconjunto` y no se
+    aplica todavía. Por tanto se aplica en ese único paso, nunca antes,
+    nunca después ni dos veces — **siempre que `prev` sea el acumulado
+    EXACTO antes de insertar `t`**, no el subconjunto ya completo: un
+    conjunto de una sola tabla (`touched = {t}`) satisface trivialmente
+    `touched ⊆ subset` para CUALQUIER subconjunto que contenga a `t`, así
+    que si se comprobase contra el subconjunto ya completo (en vez de
+    contra `prev`) se volvería a "aplicar" cada vez que `t` se une a un
+    acumulado, además de en su propio scan base — doble contabilización
+    real, detectada por `test_properties.py` antes de publicar (ver
+    `../PROGRESS.md`). La condición `touched_mask == bit and prev != 0` de
+    abajo excluye exactamente ese caso: un conjunto puramente de `t` sólo
+    cuenta en su scan base (`prev == 0`), nunca al unirse después.
     """
 
     bit = 1 << t
-    return [
-        c.expression
-        for c in conjuncts
-        if (c.touched_mask & bit) and (c.touched_mask & subset) == c.touched_mask
-    ]
+    subset = prev | bit
+    applicable = []
+    for c in conjuncts:
+        if not (c.touched_mask & bit):
+            continue
+        if (c.touched_mask & subset) != c.touched_mask:
+            continue
+        if c.touched_mask == bit and prev != 0:
+            continue
+        applicable.append(c.expression)
+    return applicable
 
 
 def _optimize_join_order(
@@ -330,7 +354,7 @@ def _dp_join_order(
     base = [
         _plan_scan(
             tables[i],
-            _applicable_at(conjuncts, 1 << i, i),
+            _applicable_at(conjuncts, 0, i),
             catalog,
             cost_model,
             cardinality_estimator,
@@ -349,7 +373,7 @@ def _dp_join_order(
                 prev = subset ^ bit
                 if prev == 0:
                     continue
-                applicable = _applicable_at(conjuncts, subset, t)
+                applicable = _applicable_at(conjuncts, prev, t)
                 candidate = _choose_physical_join(
                     dp[prev],
                     _tables_in_mask(tables, prev),
@@ -380,7 +404,7 @@ def _greedy_join_order(
     base = [
         _plan_scan(
             tables[i],
-            _applicable_at(conjuncts, 1 << i, i),
+            _applicable_at(conjuncts, 0, i),
             catalog,
             cost_model,
             cardinality_estimator,
@@ -396,8 +420,7 @@ def _greedy_join_order(
         best_t: int | None = None
         best_candidate: PhysicalOperator | None = None
         for t in remaining:
-            new_subset = subset | (1 << t)
-            applicable = _applicable_at(conjuncts, new_subset, t)
+            applicable = _applicable_at(conjuncts, subset, t)
             candidate = _choose_physical_join(
                 current,
                 _tables_in_mask(tables, subset),
@@ -443,26 +466,64 @@ def _choose_physical_join(
     left_indices = frozenset(range(len(left_tables)))
     new_table_stats = catalog.get(right_table.name)
 
-    equi_pair: tuple[ColumnRef, ColumnRef] | None = None
-    equi_source: Expression | None = None
+    # Se clasifica CADA conjunto de este paso por separado (no sólo el
+    # primero reconocido como igualdad) — necesario para que la
+    # cardinalidad resultante sea una función pura del subconjunto de
+    # tablas y no dependa de en qué paso concreto se aplicó cada condición
+    # (ver el docstring de `CardinalityEstimator.estimate_join_cardinality`
+    # para el porqué exacto: si sólo la primera igualdad contase, dos
+    # órdenes de inserción distintas que llegasen al mismo subconjunto
+    # podrían estimar cardinalidades distintas, rompiendo la subestructura
+    # óptima de la que depende `_dp_join_order`).
+    equi_pairs: list[tuple[ColumnRef, ColumnRef]] = []
+    equi_sources: list[Expression] = []
+    non_equi_conjuncts: list[Expression] = []
     if condition is not None:
-        direct = orient_equi_condition(condition, left_indices, resolution_tables, catalog)
-        if direct is not None:
-            equi_pair, equi_source = direct, condition
-        else:
-            for conjunct in split_conjuncts(condition):
-                found = orient_equi_condition(conjunct, left_indices, resolution_tables, catalog)
-                if found is not None:
-                    equi_pair, equi_source = found, conjunct
-                    break
+        for conjunct in split_conjuncts(condition):
+            oriented = orient_equi_condition(conjunct, left_indices, resolution_tables, catalog)
+            if oriented is not None:
+                equi_pairs.append(oriented)
+                equi_sources.append(conjunct)
+            else:
+                non_equi_conjuncts.append(conjunct)
 
-    join_column_on_new_table = equi_pair[1] if equi_pair is not None else None
+    # Dos conjuntos DISTINTOS que resultan ser la MISMA igualdad (p. ej. la
+    # misma condición repetida en el `ON` y, redundantemente, en el
+    # `WHERE`) no son dos restricciones independientes — contarla dos veces
+    # dividiría la cardinalidad por su `distinct_count` dos veces,
+    # sobrestimando la selectividad real. Se deduplica por igualdad
+    # estructural del par ya orientado antes de pasarlo al estimador.
+    unique_equi_pairs = list(dict.fromkeys(equi_pairs))
+    unique_non_equi_conjuncts = list(dict.fromkeys(non_equi_conjuncts))
+
+    # `distinct_count` crudo (del catálogo, sin escalar por filtros ya
+    # aplicados) de cada lado de cada igualdad — ver el docstring de
+    # `CardinalityEstimator.estimate_join_cardinality` para el porqué de no
+    # usar el `distinct_count` de una tabla ya filtrada.
+    equi_join_distinct_counts: list[tuple[float, float]] = []
+    for accumulated_column, new_column in unique_equi_pairs:
+        accumulated_index = resolve_table_index(accumulated_column, resolution_tables, catalog)
+        accumulated_stats = catalog.get(resolution_tables[accumulated_index].name)
+        accumulated_column_stats = accumulated_stats.columns.get(accumulated_column.name)
+        distinct_left = (
+            float(accumulated_column_stats.distinct_count)
+            if accumulated_column_stats is not None and accumulated_column_stats.distinct_count > 0
+            else accumulated_stats.row_count
+        )
+
+        new_column_stats = new_table_stats.columns.get(new_column.name)
+        distinct_right = (
+            float(new_column_stats.distinct_count)
+            if new_column_stats is not None and new_column_stats.distinct_count > 0
+            else new_table_stats.row_count
+        )
+        equi_join_distinct_counts.append((distinct_left, distinct_right))
+
     output_rows = cardinality_estimator.estimate_join_cardinality(
         left.estimated_rows,
         right.estimated_rows,
-        join_column_on_new_table,
-        new_table_stats,
-        has_unrecognized_predicate=condition is not None and equi_pair is None,
+        equi_join_distinct_counts,
+        unrecognized_conjunct_count=len(unique_non_equi_conjuncts),
     )
 
     candidates: list[PhysicalOperator] = []
@@ -474,9 +535,17 @@ def _choose_physical_join(
         PhysicalNestedLoopJoin(left, right, join_type, condition, output_rows, nested_loop_cost)
     )
 
-    if equi_pair is not None:
-        hash_condition = BinaryOp(left=equi_pair[0], operator=BinaryOperator.EQ, right=equi_pair[1])
-        residual_conjuncts = [c for c in split_conjuncts(condition) if c is not equi_source]
+    if equi_pairs:
+        # La primera igualdad reconocida (orden determinista: el de
+        # `split_conjuncts`) se usa como clave de la tabla hash; cualquier
+        # otra condición — incluida una segunda igualdad — se evalúa como
+        # filtro residual encima del join, igual que en un hash join real
+        # con más de una condición de igualdad.
+        primary_left, primary_right = equi_pairs[0]
+        hash_condition = BinaryOp(
+            left=primary_left, operator=BinaryOperator.EQ, right=primary_right
+        )
+        residual_conjuncts = equi_sources[1:] + non_equi_conjuncts
         hash_build_cost = cost_model.cost_hash_join(
             left.estimated_cost,
             left.estimated_rows,

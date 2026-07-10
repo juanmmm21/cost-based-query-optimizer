@@ -102,27 +102,49 @@ def test_unknown_predicate_shape_uses_default() -> None:
 
 
 def test_join_cardinality_cross_product_without_predicate() -> None:
-    stats = table(50, {"id": col(50)})
-    result = ESTIMATOR.estimate_join_cardinality(
-        100, 50, None, stats, has_unrecognized_predicate=False
-    )
+    result = ESTIMATOR.estimate_join_cardinality(100, 50, [], unrecognized_conjunct_count=0)
     assert result == pytest.approx(100 * 50)
 
 
 def test_join_cardinality_uses_containment_formula() -> None:
-    stats = table(50, {"id": col(50)})
     result = ESTIMATOR.estimate_join_cardinality(
-        1000, 50, ref("id"), stats, has_unrecognized_predicate=False
+        1000, 50, [(50, 50)], unrecognized_conjunct_count=0
     )
     assert result == pytest.approx((1000 * 50) / 50)
 
 
-def test_join_cardinality_unrecognized_predicate_reduces_by_default_factor() -> None:
-    stats = table(50, {"id": col(50)})
-    result = ESTIMATOR.estimate_join_cardinality(
-        100, 50, None, stats, has_unrecognized_predicate=True
+def test_join_cardinality_uses_max_of_both_sides_symmetrically() -> None:
+    # a.x (distinct=10) = b.y (distinct=50): el resultado no debe depender
+    # de cuál de las dos tablas se considere "nueva" en este paso — ver el
+    # docstring de `estimate_join_cardinality` (simetría necesaria para que
+    # la reordenación de joins sea determinista y correcta).
+    forward = ESTIMATOR.estimate_join_cardinality(
+        1000, 50, [(10, 50)], unrecognized_conjunct_count=0
     )
+    backward = ESTIMATOR.estimate_join_cardinality(
+        50, 1000, [(50, 10)], unrecognized_conjunct_count=0
+    )
+    assert forward == pytest.approx((1000 * 50) / 50)
+    assert backward == pytest.approx((50 * 1000) / 50)
+
+
+def test_join_cardinality_multiple_equi_columns_each_reduce_independently() -> None:
+    result = ESTIMATOR.estimate_join_cardinality(
+        1000, 50, [(50, 50), (5, 5)], unrecognized_conjunct_count=0
+    )
+    assert result == pytest.approx((1000 * 50) / 50 / 5)
+
+
+def test_join_cardinality_unrecognized_predicate_reduces_by_default_factor() -> None:
+    result = ESTIMATOR.estimate_join_cardinality(100, 50, [], unrecognized_conjunct_count=1)
     assert result == pytest.approx(100 * 50 * SimpleCardinalityEstimator.DEFAULT_JOIN_SELECTIVITY)
+
+
+def test_join_cardinality_two_unrecognized_predicates_compound() -> None:
+    result = ESTIMATOR.estimate_join_cardinality(100, 50, [], unrecognized_conjunct_count=2)
+    assert result == pytest.approx(
+        100 * 50 * SimpleCardinalityEstimator.DEFAULT_JOIN_SELECTIVITY**2
+    )
 
 
 def test_selectivity_is_always_clamped_to_unit_interval() -> None:
