@@ -292,10 +292,18 @@ class SimpleCostModel:
             # Coste mínimo: localizar la posición en el índice aunque no
             # haya coincidencias que materializar.
             return self.RANDOM_PAGE_COST
-        matched_pages = max(1.0, matched_rows / self.ROWS_PER_PAGE)
+        # A diferencia de `cost_table_scan`, aquí NO se amortiguan las filas
+        # coincidentes entre páginas (`ROWS_PER_PAGE`): este índice es
+        # secundario, no clúster (ver `models.IndexStatistics`), así que sus
+        # filas coincidentes están dispersas por la tabla sin garantía de
+        # localidad — cada una implica, en el caso pesimista estándar de
+        # cualquier optimizador de libro de texto, su propia página
+        # aleatoria. Es precisamente esto lo que hace que un `IndexScan`
+        # deje de ganar frente a un `TableScan` a partir de cierta
+        # selectividad (ver README, sección de benchmarks).
         traversal_cost = _log2(max(table_row_count, 2)) * self.CPU_OPERATOR_COST
         return (
-            matched_pages * self.RANDOM_PAGE_COST
+            matched_rows * self.RANDOM_PAGE_COST
             + matched_rows * self.CPU_INDEX_TUPLE_COST
             + traversal_cost
         )
