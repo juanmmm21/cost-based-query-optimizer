@@ -29,6 +29,7 @@ from .models import (
 )
 from .physical import build_physical_plan
 from .plan import (
+    PhysicalDistinct,
     PhysicalFilter,
     PhysicalHashAggregate,
     PhysicalHashJoin,
@@ -121,6 +122,8 @@ def _describe(node: PhysicalOperator) -> str:
         group_desc = ", ".join(_format_expr(g) for g in node.group_by)
         agg_desc = ", ".join(_format_expr(a) for a in node.aggregates)
         return f"HashAggregate(group_by=[{group_desc}], aggregates=[{agg_desc}]) {stats}"
+    if isinstance(node, PhysicalDistinct):
+        return f"Distinct {stats}"
     if isinstance(node, PhysicalProject):
         items_desc = ", ".join(_format_expr(item.expression) for item in node.items)
         return f"Project([{items_desc}]) {stats}"
@@ -137,7 +140,12 @@ def _describe(node: PhysicalOperator) -> str:
 def _children(node: PhysicalOperator) -> tuple[PhysicalOperator, ...]:
     if isinstance(
         node,
-        PhysicalFilter | PhysicalProject | PhysicalSort | PhysicalLimit | PhysicalHashAggregate,
+        PhysicalFilter
+        | PhysicalProject
+        | PhysicalSort
+        | PhysicalLimit
+        | PhysicalHashAggregate
+        | PhysicalDistinct,
     ):
         return (node.input,)
     if isinstance(node, PhysicalNestedLoopJoin | PhysicalHashJoin):

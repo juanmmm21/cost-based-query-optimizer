@@ -17,6 +17,7 @@ from .models import (
 )
 from .plan import (
     LogicalAggregate,
+    LogicalDistinct,
     LogicalFilter,
     LogicalJoin,
     LogicalLimit,
@@ -30,7 +31,8 @@ from .plan import (
 def build_logical_plan(select: SelectStatement) -> LogicalOperator:
     """Construye el plan lógico de un `SELECT`, en el mismo orden en que se
     aplican sus cláusulas: `FROM`/`JOIN` → `WHERE` → `GROUP BY`/agregados
-    (+ `HAVING`) → columnas del `SELECT` → `ORDER BY` → `LIMIT`/`OFFSET`."""
+    (+ `HAVING`) → columnas del `SELECT` → `DISTINCT` → `ORDER BY` →
+    `LIMIT`/`OFFSET`."""
 
     node: LogicalOperator = LogicalScan(select.from_table)
     for join in select.joins:
@@ -51,6 +53,9 @@ def build_logical_plan(select: SelectStatement) -> LogicalOperator:
             node = LogicalFilter(input=node, predicate=select.having)
 
     node = LogicalProject(input=node, items=select.columns)
+
+    if select.distinct:
+        node = LogicalDistinct(input=node)
 
     if select.order_by:
         node = LogicalSort(input=node, order_by=select.order_by)

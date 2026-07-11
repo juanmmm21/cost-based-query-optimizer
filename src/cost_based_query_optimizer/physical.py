@@ -76,6 +76,7 @@ from .models import (
 )
 from .plan import (
     LogicalAggregate,
+    LogicalDistinct,
     LogicalFilter,
     LogicalJoin,
     LogicalLimit,
@@ -83,6 +84,7 @@ from .plan import (
     LogicalProject,
     LogicalScan,
     LogicalSort,
+    PhysicalDistinct,
     PhysicalFilter,
     PhysicalHashAggregate,
     PhysicalHashJoin,
@@ -154,6 +156,17 @@ def build_physical_plan(
         rows = child.estimated_rows * _DERIVED_RELATION_FILTER_SELECTIVITY
         cost = cost_model.cost_filter(child.estimated_cost, child.estimated_rows)
         return PhysicalFilter(child, node.predicate, rows, cost)
+
+    if isinstance(node, LogicalDistinct):
+        child = build_physical_plan(node.input, catalog, cost_model, cardinality_estimator)
+        # Un DISTINCT es un hash aggregate sin funciones (agrupar por todas
+        # las columnas proyectadas): misma forma de coste y misma reducción
+        # determinista de cardinalidad que un GROUP BY sobre una relación
+        # derivada — y reutilizar cost_aggregate evita añadir un método al
+        # Protocol CostModel, que rompería implementaciones externas.
+        output_rows = max(1.0, math.sqrt(child.estimated_rows))
+        cost = cost_model.cost_aggregate(child.estimated_cost, child.estimated_rows, output_rows)
+        return PhysicalDistinct(child, output_rows, cost)
 
     if isinstance(node, LogicalAggregate):
         child = build_physical_plan(node.input, catalog, cost_model, cardinality_estimator)

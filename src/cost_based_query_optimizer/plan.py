@@ -67,6 +67,15 @@ class LogicalProject(LogicalOperator):
 
 
 @dataclass(frozen=True, slots=True)
+class LogicalDistinct(LogicalOperator):
+    """Deduplicación de las filas ya proyectadas (`SELECT DISTINCT`). Vive
+    entre el `LogicalProject` y el `LogicalSort`: SQL deduplica la lista de
+    salida y ordena el resultado deduplicado."""
+
+    input: LogicalOperator
+
+
+@dataclass(frozen=True, slots=True)
 class LogicalSort(LogicalOperator):
     input: LogicalOperator
     order_by: tuple[OrderByItem, ...]
@@ -188,6 +197,13 @@ class PhysicalHashAggregate(PhysicalOperator):
 class PhysicalProject(PhysicalOperator):
     input: PhysicalOperator
     items: tuple[SelectItem, ...]
+    estimated_rows: float
+    estimated_cost: float
+
+
+@dataclass(frozen=True, slots=True)
+class PhysicalDistinct(PhysicalOperator):
+    input: PhysicalOperator
     estimated_rows: float
     estimated_cost: float
 
