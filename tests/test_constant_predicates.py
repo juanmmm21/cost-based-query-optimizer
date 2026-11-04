@@ -72,3 +72,46 @@ def test_repeated_group_by_keys_are_deduplicated() -> None:
     while not isinstance(node, LogicalAggregate):
         node = node.input  # type: ignore[attr-defined]
     assert node.group_by == (ref("y"), ref("x"))
+
+
+def _scan_filters(plan: PhysicalOperator) -> dict[str, list[object]]:
+    """Predicados aplicados directamente sobre el scan de cada tabla."""
+    from cost_based_query_optimizer.plan import PhysicalTableScan
+
+    found: dict[str, list[object]] = {}
+    stack = [plan]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, PhysicalFilter) and isinstance(node.input, PhysicalTableScan):
+            found.setdefault(node.input.table.name, []).extend(_conjuncts(node.predicate))
+        for attr in ("input", "left", "right"):
+            child = getattr(node, attr, None)
+            if child is not None:
+                stack.append(child)
+    return found
+
+
+def test_in_between_like_isnull_conjuncts_of_a_join_are_pushed_to_their_table() -> None:
+    """Regresión: estas formas no se recorrían al calcular qué tablas toca
+    un conjunto; en un join quedaban sin tabla y se descartaban."""
+    from cost_based_query_optimizer.models import Between, InList, Like
+
+    in_list = InList(ref("y", "a"), (lit(1), lit(2)))
+    between = Between(ref("z", "b"), lit(1), lit(5))
+    like = Like(ref("x", "c"), lit("%"))
+    is_null = IsNull(ref("x", "a"), negated=True)
+    where = BinaryOp(
+        BinaryOp(in_list, BinaryOperator.AND, between),
+        BinaryOperator.AND,
+        BinaryOp(like, BinaryOperator.AND, is_null),
+    )
+    join_on = eq_columns(ref("x", "a"), ref("x", "c"))
+    select = star_select(
+        TableRef("a"),
+        joins=(inner_join(TableRef("c"), join_on), inner_join(TableRef("b"), lit(True))),
+        where=where,
+    )
+    filters = _scan_filters(optimize(select, CATALOG).physical_plan)
+    assert in_list in filters["a"] and is_null in filters["a"]
+    assert between in filters["b"]
+    assert like in filters["c"]
