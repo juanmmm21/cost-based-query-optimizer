@@ -48,7 +48,11 @@ def build_logical_plan(select: SelectStatement) -> LogicalOperator:
 
     aggregates = _collect_aggregate_calls(select)
     if select.group_by or aggregates:
-        node = LogicalAggregate(input=node, group_by=select.group_by, aggregates=aggregates)
+        # `GROUP BY a, b, a` agrupa exactamente igual que `GROUP BY a, b`;
+        # repetir la clave produciría dos columnas con el mismo nombre en el
+        # esquema del agregado.
+        group_by = tuple(dict.fromkeys(select.group_by))
+        node = LogicalAggregate(input=node, group_by=group_by, aggregates=aggregates)
         if select.having is not None:
             node = LogicalFilter(input=node, predicate=select.having)
 
