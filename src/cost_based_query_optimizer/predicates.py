@@ -14,12 +14,16 @@ from collections.abc import Iterator, Sequence
 
 from .errors import UnresolvedColumnError
 from .models import (
+    Between,
     BinaryOp,
     BinaryOperator,
     Catalog,
     ColumnRef,
     Expression,
     FunctionCall,
+    InList,
+    IsNull,
+    Like,
     TableRef,
     UnaryOp,
 )
@@ -67,12 +71,25 @@ def iter_column_refs(expr: Expression) -> Iterator[ColumnRef]:
         case FunctionCall(arguments=arguments):
             for argument in arguments:
                 yield from iter_column_refs(argument)
+        case Between(operand=operand, low=low, high=high):
+            yield from iter_column_refs(operand)
+            yield from iter_column_refs(low)
+            yield from iter_column_refs(high)
+        case InList(operand=operand, values=values):
+            yield from iter_column_refs(operand)
+            for value in values:
+                yield from iter_column_refs(value)
+        case Like(operand=operand, pattern=pattern):
+            yield from iter_column_refs(operand)
+            yield from iter_column_refs(pattern)
+        case IsNull(operand=operand):
+            yield from iter_column_refs(operand)
         case _:
-            # Literal, Star: no contienen columnas. Between/InList/Like/IsNull
-            # no se decomponen aquí porque este optimizador no les da
-            # tratamiento especial (ver `protocols.py`, selectividad por
-            # defecto) — sus operandos tampoco se necesitan para resolver
-            # tabla de pertenencia.
+            # Literal, Star: no contienen columnas. Antes Between/InList/
+            # Like/IsNull también caían aquí: un `t.a IN (1, 2)` de un join
+            # no "tocaba" ninguna tabla, nunca encontraba paso de join en el
+            # que aplicarse y se descartaba en silencio (resultados con
+            # filas de más). Todas las formas de expresión deben recorrerse.
             return
 
 
