@@ -343,9 +343,24 @@ def _optimize_join_order(
     cardinality_estimator: CardinalityEstimator,
 ) -> PhysicalOperator:
     conjuncts = _build_pool(pool, tables, catalog)
+    # Un conjunto que no toca ninguna tabla (`ON 1 = 0`, `NULL IS NOT NULL`)
+    # no tiene paso de inserción en el que "aplicarse" según la regla de
+    # `_applicable_at` — antes se perdía en silencio y el join se volvía un
+    # producto cartesiano. Es constante para todas las filas: se aplica una
+    # vez como filtro sobre el resultado del join (en un INNER join es
+    # equivalente a aplicarlo en cualquier paso).
+    constants = [c.expression for c in conjuncts if c.touched_mask == 0]
+    conjuncts = [c for c in conjuncts if c.touched_mask != 0]
     if len(tables) <= MAX_DP_TABLES:
-        return _dp_join_order(tables, conjuncts, catalog, cost_model, cardinality_estimator)
-    return _greedy_join_order(tables, conjuncts, catalog, cost_model, cardinality_estimator)
+        plan = _dp_join_order(tables, conjuncts, catalog, cost_model, cardinality_estimator)
+    else:
+        plan = _greedy_join_order(tables, conjuncts, catalog, cost_model, cardinality_estimator)
+    predicate = combine_conjuncts(constants)
+    if predicate is None:
+        return plan
+    rows = plan.estimated_rows * _DERIVED_RELATION_FILTER_SELECTIVITY
+    cost = cost_model.cost_filter(plan.estimated_cost, plan.estimated_rows)
+    return PhysicalFilter(plan, predicate, rows, cost)
 
 
 def _subsets_of_size(n: int, size: int) -> Iterator[int]:
