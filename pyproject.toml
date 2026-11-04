@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cost-based-query-optimizer"
-version = "0.1.0"
+version = "0.2.0"
 description = "A cost-based query optimizer that turns a SQL AST into an efficient physical execution plan with join reordering."
 readme = "README.md"
 requires-python = ">=3.11"
